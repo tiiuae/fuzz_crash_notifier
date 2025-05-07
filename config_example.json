@@ -1,0 +1,35 @@
+{
+  "notifiers": {
+    "email": {
+      "enabled": false,
+      "smtp_server": "smtp.example.com",
+      "smtp_port": 587,
+      "smtp_user": "user@example.com",
+      "smtp_password": "password",
+      "recipient_email": "notify@example.com"
+    },
+    "slack": {
+      "enabled": true,
+      "webhook_url": "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXX"
+    }
+  },
+  "fuzzers_to_watch": [
+    {
+      "name": "DummyFuzzer1",
+      "crash_dir": "./test_campaigns/dummy_fuzzer_1/crashes"
+    }
+  ],
+  "reported_crashes_file": "reported_crashes.txt",
+  "check_interval_seconds": 5,
+  "config_check_interval_seconds": 30,
+  "watchdog_file_settle_delay_ms": 500,
+  "slack_message_options": {
+    "show_content_snippet": true,
+    "content_snippet_format": "hexdump",
+    "content_snippet_hexdump_bytes": 64,
+    "content_snippet_hexdump_bytes_per_line": 16,
+    "content_snippet_max_lines": 5,
+    "content_snippet_max_bytes_per_line": 100,
+    "include_hostname": true
+  }
+}
