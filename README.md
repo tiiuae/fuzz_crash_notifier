@@ -44,7 +44,6 @@ The notifier is configured using a `config.json` file in the same directory as t
 ### Main Configuration Options:
 
 - **`notifiers`**: This object contains settings for different notification channels.
-
   - **`email`**: Holds email notification settings.
     - `enabled`: Set to `true` to enable email notifications, `false` to disable.
     - `smtp_server`: The hostname or IP address of your SMTP server (e.g., `"smtp.gmail.com"`).
@@ -55,22 +54,17 @@ The notifier is configured using a `config.json` file in the same directory as t
   - **`slack`**: Holds Slack notification settings.
     - `enabled`: Set to `true` to enable Slack notifications, `false` to disable.
     - `webhook_url`: Your Slack Incoming Webhook URL. This is obtained from your Slack app's configuration.
-
 - **`fuzzers_to_watch`**: This is an array of objects, where each object defines a fuzzer campaign to monitor.
-
   - `name`: A user-friendly name for this fuzzer campaign (e.g., `"LibAFL_TargetA"`). This name is used in notifications.
   - `crash_dir`: The full or relative path to the directory where this specific fuzzer instance saves its crash files (e.g., `"/path/to/your/libafl_campaign/output_dir/crashes"`).
     - For _LibAFL/AFL++_: This is typically `output_dir/[instance_name_if_distributed]/crashes/`.
     - For _LibFuzzer_: This is the directory specified by the `-artifact_prefix=path/to/dir/` argument when running libFuzzer, or the current working directory if `artifact_prefix` is not used.
-
 - **`reported_crashes_file`** (String, Default: `"reported_crashes.txt"`): The path to a file where the script will store the identifiers of crashes that have already been reported. This prevents sending duplicate notifications for the same crash file if the notifier is restarted. The format of each line in this file is `FuzzerName::FileName`.
-
+- `reported_unique_crashes_file` (String, Default: `"reported_unique_crashes.txt"`): Path to the file used to store identifiers (fuzzer_name::sha256_hash) of already reported unique crash contents to enable deduplication.
+- `min_crash_file_size_bytes` (Integer, Default: `1`): The minimum size (in bytes) a file must be to be considered a potential crash; files smaller than this will be ignored.
 - **`check_interval_seconds`** (Integer, Default: `10`): If the `watchdog` library is not available and the script falls back to polling mode, this value determines how often (in seconds) the configured `crash_dir` directories are scanned for new files.
-
 - **`config_check_interval_seconds`** (Integer, Default: `60`): How often (in seconds) the `config.json` file itself is checked for any modifications. If changes are detected, the configuration is hot-reloaded.
-
 - **`watchdog_file_settle_delay_ms`** (Integer, Default: `500`): When using `watchdog` mode, this is a small delay (in milliseconds) introduced after a file creation event is detected before the script processes the file. This helps ensure that the fuzzer has completely finished writing the crash file, especially for larger files or slower I/O operations.
-
 - **`slack_message_options`**: This object contains settings specifically for customizing the content and format of Slack messages.
   - `show_content_snippet` (Boolean, Default: `true`): If `true`, a snippet of the crash file's content will be included in the Slack notification.
   - `content_snippet_format` (String, Default: `"hexdump"`): Specifies the format for the content snippet. Valid options are:
@@ -131,7 +125,6 @@ You should see notifications for these new files.
 
 - [ ] Throttling/Debouncing notifications for very noisy fuzzers.
 - [ ] Option to attach reproducer files directly to emails or upload to Slack.
-- [ ] Basic crash deduplication based on content hashes.
 - [ ] Basic crash triaging (root-cause analysis) integration.
 - [ ] Support for more notification platforms (Discord, MS Teams).
 - [ ] Interactive Slack buttons (e.g., Acknowledge, Triage).

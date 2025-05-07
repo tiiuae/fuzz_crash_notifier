@@ -56,10 +56,10 @@ except Exception as e:
     print("Logging to console only.")
 # --- End Logging Setup ---
 
-
+REPORTED_UNIQUE_CRASHES_FILE_DEFAULT = "reported_unique_crashes.txt"
 CONFIG_FILE = "config.json"
 g_config = None  # Initialize global config
-g_reported_crashes = set()
+g_reported_unique_crash_ids = set()  # Stores "fuzzer_name::sha256_hash"
 g_last_config_mtime = 0
 g_active_observers = {}  # For watchdog mode: maps crash_dir to observer instance
 
@@ -86,55 +86,50 @@ def load_config_from_file():
         return False
 
 
-def load_reported_crashes():
-    global g_reported_crashes
-    reported_file_path = "reported_crashes.txt"
-    if g_config and isinstance(g_config, dict) and "reported_crashes_file" in g_config:
-        config_path = g_config.get("reported_crashes_file")
-        if isinstance(config_path, str) and config_path.strip():
-            reported_file_path = config_path.strip()
-        elif config_path is not None:
-            logging.warning(
-                f"Invalid 'reported_crashes_file' in config. Using default: {reported_file_path}"
-            )
+def get_reported_unique_crashes_filepath():
+    """Gets the filepath for storing reported unique crash IDs from config or default."""
+    if g_config and isinstance(g_config, dict):
+        # Using a more specific config key for this file
+        path_from_config = g_config.get(
+            "reported_unique_crashes_file", REPORTED_UNIQUE_CRASHES_FILE_DEFAULT
+        )
+        if isinstance(path_from_config, str) and path_from_config.strip():
+            return path_from_config.strip()
+    return REPORTED_UNIQUE_CRASHES_FILE_DEFAULT
 
-    if os.path.exists(reported_file_path):
+
+def load_reported_unique_crashes():
+    global g_reported_unique_crash_ids
+    filepath = get_reported_unique_crashes_filepath()
+
+    if os.path.exists(filepath):
         try:
-            with open(reported_file_path, "r") as f:
-                g_reported_crashes = {line.strip() for line in f if line.strip()}
+            with open(filepath, "r") as f:
+                g_reported_unique_crash_ids = {
+                    line.strip() for line in f if line.strip()
+                }
             logging.info(
-                f"Loaded {len(g_reported_crashes)} reported crashes from {reported_file_path}"
+                f"Loaded {len(g_reported_unique_crash_ids)} unique crash identifiers from {filepath}"
             )
         except IOError as e:
             logging.error(
-                f"Could not read reported crashes file {reported_file_path}: {e}"
+                f"Could not read reported unique crashes file {filepath}: {e}"
             )
     else:
         logging.info(
-            f"No existing reported crashes file found at {reported_file_path}. Will create if needed."
+            f"No existing unique crashes file found at {filepath}. Will create if needed."
         )
 
 
-def save_reported_crash(crash_id):
-    global g_reported_crashes
-    reported_file_path = "reported_crashes.txt"
-    if g_config and isinstance(g_config, dict) and "reported_crashes_file" in g_config:
-        config_path = g_config.get("reported_crashes_file")
-        if isinstance(config_path, str) and config_path.strip():
-            reported_file_path = config_path.strip()
-        elif config_path is not None:
-            logging.warning(
-                f"Invalid 'reported_crashes_file' in config during save. Using default: {reported_file_path}"
-            )
-
-    g_reported_crashes.add(crash_id)
+def save_reported_unique_crash(unique_crash_id):
+    global g_reported_unique_crash_ids
+    filepath = get_reported_unique_crashes_filepath()
+    g_reported_unique_crash_ids.add(unique_crash_id)
     try:
-        with open(reported_file_path, "a") as f:
-            f.write(crash_id + "\n")
+        with open(filepath, "a") as f:
+            f.write(unique_crash_id + "\n")
     except IOError as e:
-        logging.error(
-            f"Could not write to reported crashes file {reported_file_path}: {e}"
-        )
+        logging.error(f"Could not write to unique crashes file {filepath}: {e}")
 
 
 def send_email_notification(
@@ -433,19 +428,62 @@ def calculate_file_hashes(file_path):
 def process_new_crash(fuzzer_config, file_path):
     file_name = os.path.basename(file_path)
     fuzzer_name = fuzzer_config.get("name", "UnknownFuzzer")
-    crash_id = f"{fuzzer_name}::{file_name}"
 
-    if crash_id in g_reported_crashes:
+    # --- Early exit if file is empty or very small, unlikely to be a valid crash input ---
+    min_crash_file_size = (
+        g_config.get("min_crash_file_size_bytes", 1) if g_config else 1
+    )
+    try:
+        if os.path.getsize(file_path) < min_crash_file_size:
+            logging.debug(
+                f"File {file_name} for {fuzzer_name} is too small ({os.path.getsize(file_path)} bytes). Skipping."
+            )
+            return
+    except OSError:  # File might have been deleted between detection and processing
+        logging.warning(
+            f"Could not get size for {file_path}, might have been deleted. Skipping."
+        )
         return
 
+    # --- Calculate Hashes for Deduplication ---
+    file_hashes_for_dedupe = calculate_file_hashes(file_path)
+    sha256_hash = file_hashes_for_dedupe.get("sha256")
+
+    if not sha256_hash or sha256_hash == "N/A":
+        logging.error(
+            f"Could not get SHA256 hash for {file_path} from {fuzzer_name}. Cannot deduplicate. Reporting as unique filename."
+        )
+        # Fallback: use filename-based ID if hash fails, to avoid losing notification entirely
+        # This means we might need the old reported_crashes.txt logic as a fallback path or accept non-deduplication.
+        # For now, let's assume hash is critical for this new dedupe logic. If no hash, we might skip or have a different path.
+        # For this implementation: if hash fails, we won't report to avoid complexity. Or, we report but don't mark as "unique reported".
+        # Let's choose to log an error and skip the notification if SHA256 is vital for deduplication.
+        # Alternatively, one could use the old filename-based crash_id if sha256 is missing,
+        # but that requires managing two sets of reported items.
+        # For now: if SHA256 is unavailable, we cannot reliably deduplicate this way.
+        logging.error(
+            f"SHA256 hash unavailable for {file_path}. Skipping notification due to deduplication dependency on hash."
+        )
+        return
+
+    unique_crash_id = f"{fuzzer_name}::{sha256_hash}"
+
+    if unique_crash_id in g_reported_unique_crash_ids:
+        logging.info(
+            f"Duplicate crash content detected for {fuzzer_name}. "
+            f"File: {file_name}, SHA256: {sha256_hash}. Already reported. Skipping notification."
+        )
+        return
+
+    # --- If we are here, it's a new unique crash (by hash for this fuzzer) ---
     logging.info(
-        f"New potential crash found by {fuzzer_name}: {file_name} at {file_path}"
+        f"New UNIQUE crash content found by {fuzzer_name}: {file_name} (SHA256: {sha256_hash})"
     )
 
     timestamp_str = "N/A"
     file_size_str = "N/A"
     content_snippet = "[Snippet not generated]"
-    file_hashes = {"md5": "N/A", "sha256": "N/A"}  # Initialize
+    current_file_hashes_for_notification = file_hashes_for_dedupe
 
     try:
         stat_info = os.stat(file_path)
@@ -460,9 +498,6 @@ def process_new_crash(fuzzer_config, file_path):
             file_size_str = f"{file_size / 1024:.1f} KB"
         else:
             file_size_str = f"{file_size / (1024 * 1024):.1f} MB"
-
-        # Calculate file hashes
-        file_hashes = calculate_file_hashes(file_path)  # New call
 
         # Get content snippet
         if g_config and isinstance(g_config, dict):
@@ -491,7 +526,6 @@ def process_new_crash(fuzzer_config, file_path):
     except Exception as e:
         logging.warning(f"Could not get all file metadata/hashes for {file_path}: {e}")
 
-    # Pass file_hashes to notification functions
     send_email_notification(
         fuzzer_name,
         timestamp_str,
@@ -499,7 +533,7 @@ def process_new_crash(fuzzer_config, file_path):
         file_path,
         file_size_str,
         content_snippet,
-        file_hashes,
+        current_file_hashes_for_notification,
     )
     send_slack_notification(
         fuzzer_name,
@@ -508,9 +542,9 @@ def process_new_crash(fuzzer_config, file_path):
         file_path,
         file_size_str,
         content_snippet,
-        file_hashes,
+        current_file_hashes_for_notification,
     )
-    save_reported_crash(crash_id)
+    save_reported_unique_crash(unique_crash_id)
 
 
 def format_bytes_as_hexdump(data_bytes, bytes_per_line=16):
@@ -797,7 +831,7 @@ def main():
             g_config = {}
             logging.info("Initialized g_config to empty dict as initial load failed.")
 
-    load_reported_crashes()
+    load_reported_unique_crashes()
 
     if USE_WATCHDOG:
         logging.info("Initializing watchdog observers...")
