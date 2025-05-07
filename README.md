@@ -2,6 +2,10 @@
 
 A Python-based notification system designed to monitor fuzzer crash directories and send alerts via Email and/or Slack when new crashes are discovered. This tool helps automate the monitoring of long-running fuzzing campaigns.
 
+## Demo
+
+![Demo](img/demo.png)
+
 ## Features
 
 - **Real-time Monitoring:** Utilizes `watchdog` for efficient, event-based file system monitoring. Falls back to periodic polling if `watchdog` is not available.
@@ -22,8 +26,8 @@ A Python-based notification system designed to monitor fuzzer crash directories 
 
 ## Prerequisites
 
-- Python 3.7+
-- `pip` for installing dependencies
+- Python 3.10+
+- [uv](https://github.com/astral-sh/uv) for managing the dependency installation.
 
 ## Installation
 
@@ -31,7 +35,7 @@ A Python-based notification system designed to monitor fuzzer crash directories 
     If you have it in a git repo:
 
     ```bash
-    git clone https://github.com/tiiuae/fuzz_notifier.git
+    git clone https://github.com/tiiuae/fuzz_crash_notifier.git
     cd fuzz_notifier
     ```
 
@@ -90,39 +94,34 @@ The notifier is configured using a `config.json` file in the same directory as t
     ```
     Alternatively, consider setting it up as a systemd service for more robust background operation.
 
-## How it Works
+## How It Works
 
-- The script starts by loading its configuration and any previously reported crashes.
-- If `watchdog` is available, it sets up observers to monitor the specified `crash_dir` for each fuzzer. When a new file is created, `watchdog` triggers an event.
-- If `watchdog` is not available, the script falls back to polling the directories at the `check_interval_seconds`.
+- The script starts by loading its configuration (`config.json`) and the list of previously reported unique crash hashes (from the file specified by `reported_unique_crashes_file`, e.g., `reported_unique_crashes.txt`).
+- If the `watchdog` library is available, it sets up observers to monitor the specified `crash_dir` for each configured fuzzer. When a new file is created in a monitored directory, `watchdog` triggers an event.
+- If `watchdog` is not available, the script falls back to periodically polling the configured crash directories at the interval defined by `check_interval_seconds`.
 - When a new file is detected in a crash directory:
-  1.  A unique ID for the crash (`FuzzerName::FileName`) is generated.
-  2.  It checks against the `reported_crashes.txt` list.
-  3.  If it's a new, unreported crash:
-      - It gathers the fuzzer name, timestamp (file creation/modification), filename, file size, and (if configured) a content snippet.
-      - It sends notifications via enabled email and/or Slack channels.
-      - The crash ID is added to `g_reported_crashes` (in memory) and appended to `reported_crashes_file`.
-- The script periodically checks `config.json` for changes. If the configuration is updated, it reloads the settings and adjusts its monitoring (e.g., stops/starts watchdog observers for changed directories) without losing the list of already reported crashes.
-
-## Example Fuzzing Campaign Setup (for testing)
-
-To test the notifier, you can simulate a fuzzer.
-See `simulate_fuzzer.py` (if provided with the project) or manually create files in the configured crash directories.
-
-For example, if you have a fuzzer configured named "MyTestFuzzer" watching `./test_crashes/`:
-
-```bash
-mkdir -p ./test_crashes
-# Run fuzzer_notify.py in one terminal
-# In another terminal:
-touch ./test_crashes/crash_01.txt
-echo "CRASHDATA" > ./test_crashes/another_crash.bin
-```
-
-You should see notifications for these new files.
+  1.  The script first checks if the file meets a minimum size requirement (configurable via `min_crash_file_size_bytes`) to filter out empty or tiny, potentially irrelevant files.
+  2.  The MD5 and SHA256 hashes of the file's content are calculated.
+  3.  A unique crash identifier is formed using `FuzzerName::SHA256Hash`.
+  4.  This identifier is checked against the in-memory set of `g_reported_unique_crash_ids` (loaded from the unique crashes file).
+  5.  **If the `FuzzerName::SHA256Hash` is new for that fuzzer:**
+      - It's considered a new unique crash.
+      - The script gathers the fuzzer name, timestamp (file creation/modification), filename, file path, file size, the calculated MD5 and SHA256 hashes, and (if configured) a content snippet (text or hexdump).
+      - Notifications are sent via any enabled email and/or Slack channels with this information.
+      - The `FuzzerName::SHA256Hash` identifier is added to `g_reported_unique_crash_ids` (in memory) and appended to the unique crashes file (e.g., `reported_unique_crashes.txt`).
+  6.  **If the `FuzzerName::SHA256Hash` has already been reported for that fuzzer:**
+      - The script logs that a duplicate crash (by content) was found under a potentially new filename and skips sending a notification. This significantly reduces alert fatigue for recurring crash conditions.
+- The script periodically checks `config.json` for modifications (at the interval defined by `config_check_interval_seconds`).
+- If the configuration file is updated, the script reloads the settings. This includes updating fuzzer configurations, notification settings, etc.
+  - If using `watchdog`, existing observers are stopped, and new ones are started based on the updated fuzzer list and their `crash_dir` paths.
+  - The in-memory set of `g_reported_unique_crash_ids` (containing `FuzzerName::SHA256Hash` entries) is **preserved** across configuration reloads to ensure that previously reported unique crashes are not re-notified.
 
 ## TODOs
 
+- [ ] Enhanced messages with:
+  - [ ] Stack trace snippet
+  - [ ] Crash Type/Signal
+  - [ ] Reproducability status
 - [ ] Throttling/Debouncing notifications for very noisy fuzzers.
 - [ ] Option to attach reproducer files directly to emails or upload to Slack.
 - [ ] Basic crash triaging (root-cause analysis) integration.

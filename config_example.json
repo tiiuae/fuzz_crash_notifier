@@ -19,7 +19,8 @@
       "crash_dir": "./test_campaigns/dummy_fuzzer_1/crashes"
     }
   ],
-  "reported_crashes_file": "reported_crashes.txt",
+  "reported_unique_crashes_file": "logs/my_unique_crashes_database.txt",
+  "min_crash_file_size_bytes": 1,
   "check_interval_seconds": 5,
   "config_check_interval_seconds": 30,
   "watchdog_file_settle_delay_ms": 500,
