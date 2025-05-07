@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -143,6 +144,7 @@ def send_email_notification(
     reproducer_path,
     file_size_str,
     content_snippet,
+    file_hashes,
 ):
     if not g_config:
         logging.error("Cannot send email: Global config not loaded.")
@@ -158,6 +160,8 @@ def send_email_notification(
         f"Reproducer: {reproducer_name}",
         f"Path: {reproducer_path}",
         f"Size: {file_size_str}",
+        f"MD5: {file_hashes.get('md5', 'N/A')}",
+        f"SHA256: {file_hashes.get('sha256', 'N/A')}",
     ]
     if content_snippet:
         body_lines.append(f"\nContent Snippet:\n---\n{content_snippet}\n---")
@@ -269,6 +273,7 @@ def send_slack_notification(
     reproducer_path,
     file_size_str,
     content_snippet,
+    file_hashes={},
 ):
     if not g_config:
         logging.error("Cannot send Slack message: Global config not loaded.")
@@ -303,9 +308,21 @@ def send_slack_notification(
         except Exception:
             pass  # Don't break notification for this
 
-    text_message = " | ".join(text_message_parts)  # A concise version for notifications
+    # Concise text message for fallback and push notifications
+    text_message_parts = [
+        f"New Crash by {fuzzer_name}!",
+        f"Reproducer: {reproducer_name}",
+        f"SHA256: {file_hashes.get('sha256', 'N/A')[:12]}...",  # Shortened SHA256 for push
+    ]
+    if slack_msg_opts.get("include_hostname", True):
+        try:
+            hostname = socket.gethostname()
+            text_message_parts.append(f"Host: {hostname}")
+        except Exception:
+            pass
+    text_message = " | ".join(text_message_parts)
 
-    # Construct Block Kit payload
+    # Block Kit payload
     blocks = [
         {
             "type": "header",
@@ -315,7 +332,7 @@ def send_slack_notification(
                 "emoji": True,
             },
         },
-        {
+        {  # Section for primary info
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": f"*Fuzzer:*\n{fuzzer_name}"},
@@ -324,42 +341,35 @@ def send_slack_notification(
                 {"type": "mrkdwn", "text": f"*Size:*\n{file_size_str}"},
             ],
         },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Path:*\n`{reproducer_path}`"},
-        },
     ]
 
+    # Add hostname if configured and space allows in the fields array
     if slack_msg_opts.get("include_hostname", True):
+        hostname_str = "Unknown"
         try:
-            hostname = socket.gethostname()
-            # Add to the fields array if it exists, otherwise create a new section
-            if (
-                len(blocks[1].get("fields", [])) < 10
-            ):  # Slack limits fields in a section
-                blocks[1]["fields"].append(
-                    {"type": "mrkdwn", "text": f"*Host:*\n{hostname}"}
-                )
-            else:  # Add as a new section if fields are full or structure changed
-                blocks.append(
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*Host:*\n{hostname}"},
-                    }
-                )
+            hostname_str = socket.gethostname()
         except Exception as e:
             logging.warning(f"Could not retrieve hostname for Slack: {e}")
-            if len(blocks[1].get("fields", [])) < 10:
-                blocks[1]["fields"].append(
-                    {"type": "mrkdwn", "text": "*Host:*\nUnknown"}
-                )
-            else:
-                blocks.append(
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": "*Host:*\nUnknown"},
-                    }
-                )
+
+        if len(blocks[1]["fields"]) < 10:  # Slack limit of 10 fields
+            blocks[1]["fields"].append(
+                {"type": "mrkdwn", "text": f"*Host:*\n{hostname_str}"}
+            )
+        else:  # Add as a new section if fields are full
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*Host:*\n{hostname_str}"},
+                }
+            )
+
+    # Section for Path and Hashes
+    path_and_hashes_fields = [
+        {"type": "mrkdwn", "text": f"*Path:*\n`{reproducer_path}`"},
+        {"type": "mrkdwn", "text": f"*MD5:*\n`{file_hashes.get('md5', 'N/A')}`"},
+        {"type": "mrkdwn", "text": f"*SHA256:*\n`{file_hashes.get('sha256', 'N/A')}`"},
+    ]
+    blocks.append({"type": "section", "fields": path_and_hashes_fields})
 
     if slack_msg_opts.get("show_content_snippet", True) and content_snippet:
         blocks.append({"type": "divider"})
@@ -379,25 +389,45 @@ def send_slack_notification(
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"Sent by Fuzzing Notifier at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                    "text": f"Sent by Fuzzer Notifier at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}",
                 }
             ],
         }
     )
 
-    payload = {
-        "text": text_message,  # Fallback text and for push notifications
-        "blocks": blocks,
-    }
+    payload = {"text": text_message, "blocks": blocks}
 
     try:
+        # ... (requests.post logic) ...
         response = requests.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
-        logging.info(f"Slack notification sent for {reproducer_name} (using Block Kit)")
+        logging.info(f"Slack notification sent for {reproducer_name} (with hashes)")
     except requests.exceptions.RequestException as e:
         logging.error(
-            f"Failed to send Slack message (Block Kit) for {reproducer_name}: {e}"
+            f"Failed to send Slack message (with hashes) for {reproducer_name}: {e}"
         )
+
+
+def calculate_file_hashes(file_path):
+    """Calculates MD5 and SHA256 hashes for a given file."""
+    hashes = {"md5": "N/A", "sha256": "N/A"}
+    try:
+        # Ensure file is read in binary mode for hashing
+        with open(file_path, "rb") as f:
+            md5_hash = hashlib.md5()
+            sha256_hash = hashlib.sha256()
+            while chunk := f.read(8192):  # Read in chunks
+                md5_hash.update(chunk)
+                sha256_hash.update(chunk)
+            hashes["md5"] = md5_hash.hexdigest()
+            hashes["sha256"] = sha256_hash.hexdigest()
+    except FileNotFoundError:
+        logging.warning(f"File not found for hashing: {file_path}")
+    except IOError as e:
+        logging.error(f"IOError calculating hashes for {file_path}: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error calculating hashes for {file_path}: {e}")
+    return hashes
 
 
 def process_new_crash(fuzzer_config, file_path):
@@ -414,7 +444,8 @@ def process_new_crash(fuzzer_config, file_path):
 
     timestamp_str = "N/A"
     file_size_str = "N/A"
-    content_snippet = ""
+    content_snippet = "[Snippet not generated]"
+    file_hashes = {"md5": "N/A", "sha256": "N/A"}  # Initialize
 
     try:
         stat_info = os.stat(file_path)
@@ -430,24 +461,18 @@ def process_new_crash(fuzzer_config, file_path):
         else:
             file_size_str = f"{file_size / (1024 * 1024):.1f} MB"
 
-        # Get content snippet if configured
-        content_snippet = "[Snippet not generated]"  # Default
+        # Calculate file hashes
+        file_hashes = calculate_file_hashes(file_path)  # New call
+
+        # Get content snippet
         if g_config and isinstance(g_config, dict):
-            # Shared message options or specific to Slack/Email
             msg_opts = g_config.get(
-                "slack_message_options", {}
-            )  # Or a general "message_options"
-
+                "slack_message_options", g_config.get("message_options", {})
+            )
             if msg_opts.get("show_content_snippet", True):
-                snippet_format = msg_opts.get(
-                    "content_snippet_format", "hexdump"
-                )  # Default to hexdump
-
-                # Hexdump specific config
+                snippet_format = msg_opts.get("content_snippet_format", "hexdump")
                 hexdump_total_bytes = msg_opts.get("content_snippet_hexdump_bytes", 64)
                 hexdump_bpl = msg_opts.get("content_snippet_hexdump_bytes_per_line", 16)
-
-                # Text specific config (for fallback or if "text" is chosen)
                 text_max_lines = msg_opts.get("content_snippet_max_lines", 5)
                 text_max_bpl = msg_opts.get("content_snippet_max_bytes_per_line", 100)
                 text_max_total_bytes = msg_opts.get(
@@ -461,18 +486,29 @@ def process_new_crash(fuzzer_config, file_path):
                     hexdump_bytes_per_line=hexdump_bpl,
                     max_text_lines=text_max_lines,
                     max_bytes_per_text_line=text_max_bpl,
-                    max_total_text_bytes=text_max_total_bytes,  # Pass this to text mode
+                    max_total_text_bytes=text_max_total_bytes,
                 )
-
     except Exception as e:
-        logging.warning(f"Could not get all file metadata for {file_path}: {e}")
-        # timestamp_str and file_size_str will keep their "N/A" or last good value
+        logging.warning(f"Could not get all file metadata/hashes for {file_path}: {e}")
 
+    # Pass file_hashes to notification functions
     send_email_notification(
-        fuzzer_name, timestamp_str, file_name, file_path, file_size_str, content_snippet
+        fuzzer_name,
+        timestamp_str,
+        file_name,
+        file_path,
+        file_size_str,
+        content_snippet,
+        file_hashes,
     )
     send_slack_notification(
-        fuzzer_name, timestamp_str, file_name, file_path, file_size_str, content_snippet
+        fuzzer_name,
+        timestamp_str,
+        file_name,
+        file_path,
+        file_size_str,
+        content_snippet,
+        file_hashes,
     )
     save_reported_crash(crash_id)
 
