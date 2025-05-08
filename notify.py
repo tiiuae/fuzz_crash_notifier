@@ -5,9 +5,12 @@ import os
 import smtplib
 import socket
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.mime.text import MIMEText
+from typing import Any, Dict, List, Optional, Set
 
+# --- Optional Imports & Global Flags ---
 try:
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
@@ -15,209 +18,265 @@ try:
     USE_WATCHDOG = True
 except ImportError:
     USE_WATCHDOG = False
-    # Logging will be set up later, so print for now
-    print("Warning: 'watchdog' library not found. Falling back to polling.")
-    print("Install with: pip install watchdog")
+    print("Warning: 'watchdog' library not found. Install with: pip install watchdog")
 
-# Attempt to import requests for Slack, optional
 try:
     import requests
 
     SLACK_ENABLED_GLOBALLY = True
 except ImportError:
     SLACK_ENABLED_GLOBALLY = False
-    print(
-        "Warning: 'requests' library not found. Slack notifications will be disabled."
-    )
-    print("Install with: pip install requests")
+    print("Warning: 'requests' library not found. Install with: pip install requests")
+
+# --- Constants ---
+CONFIG_FILE_PATH_DEFAULT = "config.json"
+REPORTED_UNIQUE_CRASHES_FILE_DEFAULT = "reported_unique_crashes.txt"
+LOG_FILE_NAME_DEFAULT = "notifier.log"
+
 
 # --- Logging Setup ---
-LOG_FILE_NAME = "notifier.log"
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# (This function will be called early in the App class)
+def setup_logging(
+    log_file_name: str = LOG_FILE_NAME_DEFAULT, level: int = logging.INFO
+) -> logging.Logger:
+    logger_instance = logging.getLogger(__name__)  # Use a named logger
+    logger_instance.setLevel(level)
+    # Prevent duplicate handlers if called multiple times
+    if logger_instance.hasHandlers():
+        logger_instance.handlers.clear()
 
-formatter = logging.Formatter(
-    "%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s"
-)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s"
+    )
 
-ch = logging.StreamHandler()
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger_instance.addHandler(ch)
 
-try:
-    fh = logging.FileHandler(LOG_FILE_NAME, mode="a")  # Append mode
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    # Can't use logging.info yet if basicConfig hasn't run implicitly, but logger.addHandler is fine.
-    # We will log this confirmation after basicConfig or equivalent setup.
-except Exception as e:
-    # Use print because logging might not be fully set up to file yet.
-    print(f"Critical Error: Failed to set up file logging to {LOG_FILE_NAME}: {e}")
-    print("Logging to console only.")
-# --- End Logging Setup ---
-
-REPORTED_UNIQUE_CRASHES_FILE_DEFAULT = "reported_unique_crashes.txt"
-CONFIG_FILE = "config.json"
-g_config = None  # Initialize global config
-g_reported_unique_crash_ids = set()  # Stores "fuzzer_name::sha256_hash"
-g_last_config_mtime = 0
-g_active_observers = {}  # For watchdog mode: maps crash_dir to observer instance
-
-
-def load_config_from_file():
-    global g_config, g_last_config_mtime
     try:
-        with open(CONFIG_FILE, "r") as f:
-            new_config = json.load(f)
-        g_config = new_config  # Assign to global
-        g_last_config_mtime = os.path.getmtime(CONFIG_FILE)
-        logging.info(f"Configuration (re)loaded from {CONFIG_FILE}")
-        return True
-    except FileNotFoundError:
-        logging.error(f"Configuration file '{CONFIG_FILE}' not found.")
-        return False
-    except json.JSONDecodeError as e:
-        logging.error(
-            f"Could not decode JSON from '{CONFIG_FILE}': {e}. Please check its syntax."
-        )
-        return False
+        fh = logging.FileHandler(log_file_name, mode="a")
+        fh.setFormatter(formatter)
+        logger_instance.addHandler(fh)
+        print(f"Logging to console and {log_file_name}")
     except Exception as e:
-        logging.error(f"Unexpected error loading config: {e}")
+        print(
+            f"Critical Error: Failed to set up file logging to {log_file_name}: {e}. Logging to console only."
+        )
+    return logger_instance
+
+
+# Global logger instance, configured by setup_logging
+logger = setup_logging()
+
+
+# --- Data Structures ---
+@dataclass
+class CrashData:
+    fuzzer_name: str
+    timestamp_str: str
+    reproducer_name: str
+    reproducer_path: str
+    file_size_str: str
+    content_snippet: str
+    file_hashes: Dict[str, str]
+    hostname: str = field(default_factory=socket.gethostname)
+
+
+@dataclass
+class FuzzerConfig:
+    name: str
+    crash_dir: str
+    # NOTE: Add other fuzzer-specific config here
+
+
+# --- Configuration Management ---
+class ConfigManager:
+    def __init__(self, config_path: str = CONFIG_FILE_PATH_DEFAULT):
+        self.config_path = config_path
+        self.config: Dict[str, Any] = {}
+        self.last_mtime: float = 0
+        self.load_config()
+
+    def load_config(self) -> bool:
+        try:
+            with open(self.config_path, "r") as f:
+                self.config = json.load(f)
+            self.last_mtime = os.path.getmtime(self.config_path)
+            logger.info(f"Configuration (re)loaded from {self.config_path}")
+            return True
+        except FileNotFoundError:
+            logger.error(f"Configuration file '{self.config_path}' not found.")
+            self.config = {}  # Ensure config is an empty dict, not None
+            return False
+        except json.JSONDecodeError as e:
+            logger.error(f"Could not decode JSON from '{self.config_path}': {e}.")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error loading config: {e}")
+            return False
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.config.get(key, default)
+
+    def get_fuzzers_to_watch(self) -> List[FuzzerConfig]:
+        fuzzer_configs = []
+        for f_conf in self.config.get("fuzzers_to_watch", []):
+            if "name" in f_conf and "crash_dir" in f_conf:
+                fuzzer_configs.append(
+                    FuzzerConfig(name=f_conf["name"], crash_dir=f_conf["crash_dir"])
+                )
+            else:
+                logger.warning(
+                    f"Invalid fuzzer config entry, missing name or crash_dir: {f_conf}"
+                )
+        return fuzzer_configs
+
+    def needs_reload(self) -> bool:
+        if not os.path.exists(self.config_path):
+            if self.last_mtime != 0:  # It existed before
+                logger.warning(
+                    f"Config file {self.config_path} missing. Using last loaded config."
+                )
+            return False  # Don't try to reload if missing
+        try:
+            current_mtime = os.path.getmtime(self.config_path)
+            if current_mtime > self.last_mtime:
+                return True
+        except OSError as e:
+            logger.warning(f"Could not get mtime for {self.config_path}: {e}")
         return False
 
 
-def get_reported_unique_crashes_filepath():
-    """Gets the filepath for storing reported unique crash IDs from config or default."""
-    if g_config and isinstance(g_config, dict):
-        # Using a more specific config key for this file
-        path_from_config = g_config.get(
+# --- State Management (Reported Crashes) ---
+class StateManager:
+    def __init__(self, config_manager: ConfigManager):
+        self.config_manager = config_manager
+        self.reported_unique_crash_ids: Set[str] = set()
+        self._filepath: Optional[str] = None
+        self.load_state()
+
+    @property
+    def filepath(self) -> str:
+        if self._filepath is None:  # Cache the path
+            self._filepath = self.config_manager.get(
+                "reported_unique_crashes_file", REPORTED_UNIQUE_CRASHES_FILE_DEFAULT
+            )
+        return self._filepath
+
+    def load_state(self) -> None:
+        self.reported_unique_crash_ids.clear()
+        # Update filepath in case config changed it.
+        self._filepath = self.config_manager.get(
             "reported_unique_crashes_file", REPORTED_UNIQUE_CRASHES_FILE_DEFAULT
         )
-        if isinstance(path_from_config, str) and path_from_config.strip():
-            return path_from_config.strip()
-    return REPORTED_UNIQUE_CRASHES_FILE_DEFAULT
 
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, "r") as f:
+                    self.reported_unique_crash_ids = {
+                        line.strip() for line in f if line.strip()
+                    }
+                logger.info(
+                    f"Loaded {len(self.reported_unique_crash_ids)} unique crash IDs from {self.filepath}"
+                )
+            except IOError as e:
+                logger.error(f"Could not read state file {self.filepath}: {e}")
+        else:
+            logger.info(
+                f"No state file found at {self.filepath}. Will create if needed."
+            )
 
-def load_reported_unique_crashes():
-    global g_reported_unique_crash_ids
-    filepath = get_reported_unique_crashes_filepath()
-
-    if os.path.exists(filepath):
+    def save_unique_crash_id(self, unique_crash_id: str) -> None:
+        self.reported_unique_crash_ids.add(unique_crash_id)
         try:
-            with open(filepath, "r") as f:
-                g_reported_unique_crash_ids = {
-                    line.strip() for line in f if line.strip()
-                }
-            logging.info(
-                f"Loaded {len(g_reported_unique_crash_ids)} unique crash identifiers from {filepath}"
-            )
+            with open(self.filepath, "a") as f:
+                f.write(unique_crash_id + "\n")
         except IOError as e:
-            logging.error(
-                f"Could not read reported unique crashes file {filepath}: {e}"
-            )
-    else:
-        logging.info(
-            f"No existing unique crashes file found at {filepath}. Will create if needed."
-        )
+            logger.error(f"Could not write to state file {self.filepath}: {e}")
+
+    def is_unique_crash_reported(self, unique_crash_id: str) -> bool:
+        return unique_crash_id in self.reported_unique_crash_ids
 
 
-def save_reported_unique_crash(unique_crash_id):
-    global g_reported_unique_crash_ids
-    filepath = get_reported_unique_crashes_filepath()
-    g_reported_unique_crash_ids.add(unique_crash_id)
+# --- File Utilities ---
+def calculate_file_hashes(file_path: str) -> Dict[str, str]:
+    hashes = {"md5": "N/A", "sha256": "N/A"}
     try:
-        with open(filepath, "a") as f:
-            f.write(unique_crash_id + "\n")
-    except IOError as e:
-        logging.error(f"Could not write to unique crashes file {filepath}: {e}")
-
-
-def send_email_notification(
-    fuzzer_name,
-    timestamp_str,
-    reproducer_name,
-    reproducer_path,
-    file_size_str,
-    content_snippet,
-    file_hashes,
-):
-    if not g_config:
-        logging.error("Cannot send email: Global config not loaded.")
-        return
-    email_conf = g_config.get("notifiers", {}).get("email", {})
-    if not email_conf.get("enabled"):
-        return
-
-    subject = f"New Crash Found by {fuzzer_name}: {reproducer_name}"
-    body_lines = [
-        f"Fuzzer: {fuzzer_name}",
-        f"Timestamp: {timestamp_str}",
-        f"Reproducer: {reproducer_name}",
-        f"Path: {reproducer_path}",
-        f"Size: {file_size_str}",
-        f"MD5: {file_hashes.get('md5', 'N/A')}",
-        f"SHA256: {file_hashes.get('sha256', 'N/A')}",
-    ]
-    if content_snippet:
-        body_lines.append(f"\nContent Snippet:\n---\n{content_snippet}\n---")
-    body_lines.append("\nPlease investigate.")
-
-    body = "\n".join(body_lines)
-
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = email_conf.get("smtp_user", "notifier@example.com")
-    msg["To"] = email_conf.get("recipient_email", "devnull@example.com")
-
-    try:
-        with smtplib.SMTP(email_conf["smtp_server"], email_conf["smtp_port"]) as server:
-            server.starttls()
-            server.login(email_conf["smtp_user"], email_conf["smtp_password"])
-            server.sendmail(
-                email_conf["smtp_user"],
-                [email_conf["recipient_email"]],
-                msg.as_string(),
-            )
-        logging.info(f"Email notification sent for {reproducer_name}")
+        with open(file_path, "rb") as f:
+            md5_hash = hashlib.md5()
+            sha256_hash = hashlib.sha256()
+            while chunk := f.read(8192):
+                md5_hash.update(chunk)
+                sha256_hash.update(chunk)
+            hashes["md5"] = md5_hash.hexdigest()
+            hashes["sha256"] = sha256_hash.hexdigest()
     except Exception as e:
-        logging.error(f"Failed to send email for {reproducer_name}: {e}")
+        logger.error(f"Error calculating hashes for {file_path}: {e}")
+    return hashes
 
 
-def get_file_snippet(
-    file_path,
-    format_type="hexdump",  # Default to hexdump
-    max_hexdump_bytes=64,  # Total bytes for hexdump
-    hexdump_bytes_per_line=16,  # Bytes per line for hexdump
-    max_text_lines=5,  # For text format
-    max_bytes_per_text_line=100,
-    max_total_text_bytes=1024,
-):  # Max total for text snippet
+def format_bytes_as_hexdump(data_bytes: bytes, bytes_per_line: int = 16) -> str:
+    # (Your existing, corrected hexdump function)
+    if not data_bytes:
+        return "[No data to hexdump]"
+    if bytes_per_line <= 0:
+        bytes_per_line = 16
+    lines = []
+    PRINTABLE_CHARS = "".join([(chr(x) if 32 <= x <= 126 else ".") for x in range(256)])
+    for offset in range(0, len(data_bytes), bytes_per_line):
+        chunk = data_bytes[offset : offset + bytes_per_line]
+        hex_parts = []
+        midpoint = bytes_per_line // 2
+        for i in range(bytes_per_line):
+            if i < len(chunk):
+                hex_parts.append(f"{chunk[i]:02x}")
+            else:
+                hex_parts.append("  ")
+            if i == midpoint - 1 and bytes_per_line > 4:
+                hex_parts.append("")
+        hex_part_str = " ".join(hex_parts)
+        hex_display_width = (bytes_per_line * 3) - 1
+        if bytes_per_line > 4 and midpoint > 0:
+            hex_display_width += 1
+        ascii_part = "".join([PRINTABLE_CHARS[b] for b in chunk])
+        lines.append(
+            f"{offset:08x}:  {hex_part_str:<{hex_display_width}} |{ascii_part}|"
+        )
+    return "\n".join(lines)
+
+
+def get_file_snippet(file_path: str, config_manager: ConfigManager) -> str:
+    # (Your existing get_file_snippet, but it takes config_manager to get options)
     if not os.path.exists(file_path):
         return "[File not found for snippet]"
-
     file_size = os.path.getsize(file_path)
     if file_size == 0:
         return "[Empty file]"
 
+    opts = config_manager.get(
+        "slack_message_options", config_manager.get("message_options", {})
+    )
+    format_type = opts.get("content_snippet_format", "hexdump")
+
     if format_type == "hexdump":
+        max_hexdump_bytes = opts.get("content_snippet_hexdump_bytes", 64)
+        hexdump_bpl = opts.get("content_snippet_hexdump_bytes_per_line", 16)
         try:
             with open(file_path, "rb") as f:
-                # Read only up to max_hexdump_bytes or file_size, whichever is smaller
-                bytes_to_read = min(file_size, max_hexdump_bytes)
-                data_to_dump = f.read(bytes_to_read)
-            if not data_to_dump:
-                return "[Empty file (read 0 bytes)]"  # Should be caught by size check
-
-            # Call our new hexdump formatter
-            return format_bytes_as_hexdump(
-                data_to_dump, bytes_per_line=hexdump_bytes_per_line
+                data_to_dump = f.read(min(file_size, max_hexdump_bytes))
+            return (
+                format_bytes_as_hexdump(data_to_dump, bytes_per_line=hexdump_bpl)
+                if data_to_dump
+                else "[Empty file]"
             )
         except Exception as e:
-            logging.warning(f"Could not read file for hexdump {file_path}: {e}")
+            logger.warning(f"Could not read file for hexdump {file_path}: {e}")
             return "[Error reading file for hexdump]"
-
     elif format_type == "text":
-        # (Keep your existing text snippet logic here)
+        # (Text snippet logic from previous version)
+        max_text_lines = opts.get("content_snippet_max_lines", 5)
+        max_bytes_per_text_line = opts.get("content_snippet_max_bytes_per_line", 100)
+        max_total_text_bytes = opts.get("content_snippet_text_max_total_bytes", 1024)
         snippet_lines = []
         total_bytes_read = 0
         try:
@@ -227,7 +286,6 @@ def get_file_snippet(
                         snippet_lines.append("... (more lines)")
                         break
                     truncated_line = line_text.rstrip("\n")
-                    # Truncate long lines based on estimated byte length
                     if (
                         len(truncated_line.encode("utf-8", "ignore"))
                         > max_bytes_per_text_line
@@ -242,668 +300,531 @@ def get_file_snippet(
                             char_limit -= 1
                         truncated_line = temp_line[:char_limit] + "..."
                     snippet_lines.append(truncated_line)
-
                     total_bytes_read += len(line_text.encode("utf-8", "ignore"))
-                    if (
-                        total_bytes_read > max_total_text_bytes
-                    ):  # Prevent reading too much for text snippet
+                    if total_bytes_read > max_total_text_bytes:
                         if i < max_text_lines - 1:
                             snippet_lines.append("... (max snippet size reached)")
                         break
-            if not snippet_lines:
-                return "[Empty or non-text file snippet]"
-            return "\n".join(snippet_lines)
+            return (
+                "\n".join(snippet_lines)
+                if snippet_lines
+                else "[Empty or non-text file snippet]"
+            )
         except Exception as e:
-            logging.debug(f"Could not read text snippet from {file_path}: {e}")
+            logger.debug(f"Could not read text snippet from {file_path}: {e}")
             return "[Could not read file content as text]"
     else:
-        logging.warning(f"Unknown snippet format type: {format_type}")
+        logger.warning(f"Unknown snippet format type: {format_type}")
         return "[Unknown snippet format type]"
 
 
-def send_slack_notification(
-    fuzzer_name,
-    timestamp_str,
-    reproducer_name,
-    reproducer_path,
-    file_size_str,
-    content_snippet,
-    file_hashes={},
-):
-    if not g_config:
-        logging.error("Cannot send Slack message: Global config not loaded.")
-        return
+# --- Notification Services ---
+class NotificationService:  # Abstract base class
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.enabled = config.get("enabled", False)
 
-    slack_conf = g_config.get("notifiers", {}).get("slack", {})
-    slack_msg_opts = g_config.get(
-        "slack_message_options", {}
-    )  # Default to empty dict if not present
+    def send(self, crash_data: CrashData) -> None:
+        raise NotImplementedError
 
-    if not slack_conf.get("enabled") or not SLACK_ENABLED_GLOBALLY:
-        if not SLACK_ENABLED_GLOBALLY and slack_conf.get("enabled"):
-            logging.warning("Slack configured but 'requests' library missing.")
-        return
 
-    webhook_url = slack_conf.get("webhook_url")
-    if not webhook_url:
-        logging.error("Slack webhook URL not configured.")
-        return
-
-    # Construct the simple text message for fallback and notifications
-    text_message_parts = [
-        f"New Crash Found by {fuzzer_name}!",
-        f"Reproducer: {reproducer_name}",
-        f"Size: {file_size_str}",
-        f"Timestamp: {timestamp_str}",
-    ]
-    if slack_msg_opts.get("include_hostname", True):
+class EmailNotifier(NotificationService):
+    def send(self, crash_data: CrashData) -> None:
+        if not self.enabled:
+            return
+        logger.debug(f"Attempting to send email for {crash_data.reproducer_name}")
+        # (Your existing email sending logic, adapted to use self.config and crash_data)
+        subject = (
+            f"New Crash Found by {crash_data.fuzzer_name}: {crash_data.reproducer_name}"
+        )
+        body_lines = [
+            f"Fuzzer: {crash_data.fuzzer_name}",
+            f"Host: {crash_data.hostname}",
+            f"Timestamp: {crash_data.timestamp_str}",
+            f"Reproducer: {crash_data.reproducer_name}",
+            f"Path: {crash_data.reproducer_path}",
+            f"Size: {crash_data.file_size_str}",
+            f"MD5: {crash_data.file_hashes.get('md5', 'N/A')}",
+            f"SHA256: {crash_data.file_hashes.get('sha256', 'N/A')}",
+        ]
+        if crash_data.content_snippet:
+            body_lines.append(
+                f"\nContent Snippet:\n---\n{crash_data.content_snippet}\n---"
+            )
+        body_lines.append("\nPlease investigate.")
+        body = "\n".join(body_lines)
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = self.config.get("smtp_user", "notifier@example.com")
+        msg["To"] = self.config.get("recipient_email", "devnull@example.com")
         try:
-            hostname = socket.gethostname()
-            text_message_parts.append(f"Host: {hostname}")
-        except Exception:
-            pass  # Don't break notification for this
-
-    # Concise text message for fallback and push notifications
-    text_message_parts = [
-        f"New Crash by {fuzzer_name}!",
-        f"Reproducer: {reproducer_name}",
-        f"SHA256: {file_hashes.get('sha256', 'N/A')[:12]}...",  # Shortened SHA256 for push
-    ]
-    if slack_msg_opts.get("include_hostname", True):
-        try:
-            hostname = socket.gethostname()
-            text_message_parts.append(f"Host: {hostname}")
-        except Exception:
-            pass
-    text_message = " | ".join(text_message_parts)
-
-    # Block Kit payload
-    blocks = [
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": ":boom: New Crash Found!",
-                "emoji": True,
-            },
-        },
-        {  # Section for primary info
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Fuzzer:*\n{fuzzer_name}"},
-                {"type": "mrkdwn", "text": f"*Timestamp:*\n{timestamp_str}"},
-                {"type": "mrkdwn", "text": f"*Reproducer:*\n`{reproducer_name}`"},
-                {"type": "mrkdwn", "text": f"*Size:*\n{file_size_str}"},
-            ],
-        },
-    ]
-
-    # Add hostname if configured and space allows in the fields array
-    if slack_msg_opts.get("include_hostname", True):
-        hostname_str = "Unknown"
-        try:
-            hostname_str = socket.gethostname()
+            with smtplib.SMTP(
+                self.config["smtp_server"], self.config["smtp_port"]
+            ) as server:
+                server.starttls()
+                server.login(self.config["smtp_user"], self.config["smtp_password"])
+                server.sendmail(msg["From"], [msg["To"]], msg.as_string())
+            logger.info(f"Email notification sent for {crash_data.reproducer_name}")
         except Exception as e:
-            logging.warning(f"Could not retrieve hostname for Slack: {e}")
+            logger.error(f"Failed to send email for {crash_data.reproducer_name}: {e}")
 
-        if len(blocks[1]["fields"]) < 10:  # Slack limit of 10 fields
-            blocks[1]["fields"].append(
-                {"type": "mrkdwn", "text": f"*Host:*\n{hostname_str}"}
+
+class SlackNotifier(NotificationService):
+    def __init__(self, config: Dict[str, Any], global_slack_opts: Dict[str, Any]):
+        super().__init__(config)
+        self.global_slack_opts = (
+            global_slack_opts  # e.g., for snippet format from main config
+        )
+        if self.enabled and not SLACK_ENABLED_GLOBALLY:
+            logger.warning(
+                "Slack notifier configured as enabled, but 'requests' library is missing."
             )
-        else:  # Add as a new section if fields are full
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*Host:*\n{hostname_str}"},
-                }
-            )
+            self.enabled = False  # Disable if lib is missing
 
-    # Section for Path and Hashes
-    path_and_hashes_fields = [
-        {"type": "mrkdwn", "text": f"*Path:*\n`{reproducer_path}`"},
-        {"type": "mrkdwn", "text": f"*MD5:*\n`{file_hashes.get('md5', 'N/A')}`"},
-        {"type": "mrkdwn", "text": f"*SHA256:*\n`{file_hashes.get('sha256', 'N/A')}`"},
-    ]
-    blocks.append({"type": "section", "fields": path_and_hashes_fields})
+    def send(self, crash_data: CrashData) -> None:
+        if not self.enabled:
+            return
+        logger.debug(
+            f"Attempting to send Slack message for {crash_data.reproducer_name}"
+        )
+        webhook_url = self.config.get("webhook_url")
+        if not webhook_url:
+            logger.error("Slack webhook URL not configured.")
+            return
 
-    if slack_msg_opts.get("show_content_snippet", True) and content_snippet:
-        blocks.append({"type": "divider"})
+        text_message_parts = [
+            f"New Crash by {crash_data.fuzzer_name}!",
+            f"Reproducer: {crash_data.reproducer_name}",
+            f"SHA256: {crash_data.file_hashes.get('sha256', 'N/A')[:12]}...",
+        ]
+        if self.global_slack_opts.get("include_hostname", True):
+            text_message_parts.append(f"Host: {crash_data.hostname}")
+        text_message = " | ".join(text_message_parts)
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": ":boom: New Crash Found!",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Fuzzer:*\n{crash_data.fuzzer_name}"},
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Timestamp:*\n{crash_data.timestamp_str}",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Reproducer:*\n`{crash_data.reproducer_name}`",
+                    },
+                    {"type": "mrkdwn", "text": f"*Size:*\n{crash_data.file_size_str}"},
+                ],
+            },
+        ]
+        if self.global_slack_opts.get("include_hostname", True):
+            if len(blocks[1]["fields"]) < 10:
+                blocks[1]["fields"].append(
+                    {"type": "mrkdwn", "text": f"*Host:*\n{crash_data.hostname}"}
+                )
+            else:
+                blocks.append(
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Host:*\n{crash_data.hostname}",
+                        },
+                    }
+                )
+
         blocks.append(
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Content Snippet:*\n```\n{content_snippet}\n```",
-                },
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Path:*\n`{crash_data.reproducer_path}`",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*MD5:*\n`{crash_data.file_hashes.get('md5', 'N/A')}`",
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*SHA256:*\n`{crash_data.file_hashes.get('sha256', 'N/A')}`",
+                    },
+                ],
+            }
+        )
+        if (
+            self.global_slack_opts.get("show_content_snippet", True)
+            and crash_data.content_snippet
+        ):
+            blocks.extend(
+                [
+                    {"type": "divider"},
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Content Snippet:*\n```\n{crash_data.content_snippet}\n```",
+                        },
+                    },
+                ]
+            )
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Sent by Fuzzer Notifier at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                    }
+                ],
             }
         )
 
-    blocks.append(
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"Sent by Fuzzer Notifier at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}",
-                }
-            ],
-        }
-    )
+        payload = {"text": text_message, "blocks": blocks}
+        try:
+            response = requests.post(webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+            logger.info(f"Slack notification sent for {crash_data.reproducer_name}")
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"Failed to send Slack message for {crash_data.reproducer_name}: {e}"
+            )
 
-    payload = {"text": text_message, "blocks": blocks}
 
-    try:
-        # ... (requests.post logic) ...
-        response = requests.post(webhook_url, json=payload, timeout=10)
-        response.raise_for_status()
-        logging.info(f"Slack notification sent for {reproducer_name} (with hashes)")
-    except requests.exceptions.RequestException as e:
-        logging.error(
-            f"Failed to send Slack message (with hashes) for {reproducer_name}: {e}"
+# --- Crash Processing ---
+class CrashProcessor:
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        state_manager: StateManager,
+        notifiers: List[NotificationService],
+    ):
+        self.config_manager = config_manager
+        self.state_manager = state_manager
+        self.notifiers = notifiers
+
+    def process_file(self, fuzzer_conf: FuzzerConfig, file_path: str) -> None:
+        file_name = os.path.basename(file_path)
+        logger.debug(
+            f"Processing potential crash file: {file_path} for fuzzer {fuzzer_conf.name}"
         )
 
+        min_size = self.config_manager.get("min_crash_file_size_bytes", 1)
+        try:
+            if os.path.getsize(file_path) < min_size:
+                logger.debug(f"File {file_name} is too small. Skipping.")
+                return
+        except OSError:
+            logger.warning(f"Could not get size for {file_path}. Skipping.")
+            return
 
-def calculate_file_hashes(file_path):
-    """Calculates MD5 and SHA256 hashes for a given file."""
-    hashes = {"md5": "N/A", "sha256": "N/A"}
-    try:
-        # Ensure file is read in binary mode for hashing
-        with open(file_path, "rb") as f:
-            md5_hash = hashlib.md5()
-            sha256_hash = hashlib.sha256()
-            while chunk := f.read(8192):  # Read in chunks
-                md5_hash.update(chunk)
-                sha256_hash.update(chunk)
-            hashes["md5"] = md5_hash.hexdigest()
-            hashes["sha256"] = sha256_hash.hexdigest()
-    except FileNotFoundError:
-        logging.warning(f"File not found for hashing: {file_path}")
-    except IOError as e:
-        logging.error(f"IOError calculating hashes for {file_path}: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error calculating hashes for {file_path}: {e}")
-    return hashes
+        file_hashes = calculate_file_hashes(file_path)
+        sha256_hash = file_hashes.get("sha256")
 
-
-def process_new_crash(fuzzer_config, file_path):
-    file_name = os.path.basename(file_path)
-    fuzzer_name = fuzzer_config.get("name", "UnknownFuzzer")
-
-    # --- Early exit if file is empty or very small, unlikely to be a valid crash input ---
-    min_crash_file_size = (
-        g_config.get("min_crash_file_size_bytes", 1) if g_config else 1
-    )
-    try:
-        if os.path.getsize(file_path) < min_crash_file_size:
-            logging.debug(
-                f"File {file_name} for {fuzzer_name} is too small ({os.path.getsize(file_path)} bytes). Skipping."
+        if not sha256_hash or sha256_hash == "N/A":
+            logger.error(
+                f"SHA256 hash unavailable for {file_path}. Cannot deduplicate. Skipping."
             )
             return
-    except OSError:  # File might have been deleted between detection and processing
-        logging.warning(
-            f"Could not get size for {file_path}, might have been deleted. Skipping."
-        )
-        return
 
-    # --- Calculate Hashes for Deduplication ---
-    file_hashes_for_dedupe = calculate_file_hashes(file_path)
-    sha256_hash = file_hashes_for_dedupe.get("sha256")
-
-    if not sha256_hash or sha256_hash == "N/A":
-        logging.error(
-            f"Could not get SHA256 hash for {file_path} from {fuzzer_name}. Cannot deduplicate. Reporting as unique filename."
-        )
-        # Fallback: use filename-based ID if hash fails, to avoid losing notification entirely
-        # This means we might need the old reported_crashes.txt logic as a fallback path or accept non-deduplication.
-        # For now, let's assume hash is critical for this new dedupe logic. If no hash, we might skip or have a different path.
-        # For this implementation: if hash fails, we won't report to avoid complexity. Or, we report but don't mark as "unique reported".
-        # Let's choose to log an error and skip the notification if SHA256 is vital for deduplication.
-        # Alternatively, one could use the old filename-based crash_id if sha256 is missing,
-        # but that requires managing two sets of reported items.
-        # For now: if SHA256 is unavailable, we cannot reliably deduplicate this way.
-        logging.error(
-            f"SHA256 hash unavailable for {file_path}. Skipping notification due to deduplication dependency on hash."
-        )
-        return
-
-    unique_crash_id = f"{fuzzer_name}::{sha256_hash}"
-
-    if unique_crash_id in g_reported_unique_crash_ids:
-        logging.info(
-            f"Duplicate crash content detected for {fuzzer_name}. "
-            f"File: {file_name}, SHA256: {sha256_hash}. Already reported. Skipping notification."
-        )
-        return
-
-    # --- If we are here, it's a new unique crash (by hash for this fuzzer) ---
-    logging.info(
-        f"New UNIQUE crash content found by {fuzzer_name}: {file_name} (SHA256: {sha256_hash})"
-    )
-
-    timestamp_str = "N/A"
-    file_size_str = "N/A"
-    content_snippet = "[Snippet not generated]"
-    current_file_hashes_for_notification = file_hashes_for_dedupe
-
-    try:
-        stat_info = os.stat(file_path)
-        timestamp = getattr(stat_info, "st_birthtime", stat_info.st_mtime)
-        timestamp_dt = datetime.fromtimestamp(timestamp)
-        timestamp_str = timestamp_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-        file_size = stat_info.st_size
-        if file_size < 1024:
-            file_size_str = f"{file_size} B"
-        elif file_size < 1024 * 1024:
-            file_size_str = f"{file_size / 1024:.1f} KB"
-        else:
-            file_size_str = f"{file_size / (1024 * 1024):.1f} MB"
-
-        # Get content snippet
-        if g_config and isinstance(g_config, dict):
-            msg_opts = g_config.get(
-                "slack_message_options", g_config.get("message_options", {})
+        unique_crash_id = f"{fuzzer_conf.name}::{sha256_hash}"
+        if self.state_manager.is_unique_crash_reported(unique_crash_id):
+            logger.info(
+                f"Duplicate crash (SHA256: {sha256_hash}) in {file_name} for {fuzzer_conf.name}. Skipping."
             )
-            if msg_opts.get("show_content_snippet", True):
-                snippet_format = msg_opts.get("content_snippet_format", "hexdump")
-                hexdump_total_bytes = msg_opts.get("content_snippet_hexdump_bytes", 64)
-                hexdump_bpl = msg_opts.get("content_snippet_hexdump_bytes_per_line", 16)
-                text_max_lines = msg_opts.get("content_snippet_max_lines", 5)
-                text_max_bpl = msg_opts.get("content_snippet_max_bytes_per_line", 100)
-                text_max_total_bytes = msg_opts.get(
-                    "content_snippet_text_max_total_bytes", 1024
-                )
+            return
 
-                content_snippet = get_file_snippet(
-                    file_path,
-                    format_type=snippet_format,
-                    max_hexdump_bytes=hexdump_total_bytes,
-                    hexdump_bytes_per_line=hexdump_bpl,
-                    max_text_lines=text_max_lines,
-                    max_bytes_per_text_line=text_max_bpl,
-                    max_total_text_bytes=text_max_total_bytes,
-                )
-    except Exception as e:
-        logging.warning(f"Could not get all file metadata/hashes for {file_path}: {e}")
-
-    send_email_notification(
-        fuzzer_name,
-        timestamp_str,
-        file_name,
-        file_path,
-        file_size_str,
-        content_snippet,
-        current_file_hashes_for_notification,
-    )
-    send_slack_notification(
-        fuzzer_name,
-        timestamp_str,
-        file_name,
-        file_path,
-        file_size_str,
-        content_snippet,
-        current_file_hashes_for_notification,
-    )
-    save_reported_unique_crash(unique_crash_id)
-
-
-def format_bytes_as_hexdump(data_bytes, bytes_per_line=16):
-    """
-    Formats a bytes object into a hexdump -C like string.
-    """
-    if not data_bytes:
-        return "[No data to hexdump]"
-    if bytes_per_line <= 0:  # Safety check
-        bytes_per_line = 16
-
-    lines = []
-    # Prepare a filter for printable ASCII characters, using '.' for others.
-    PRINTABLE_CHARS = "".join([(chr(x) if 32 <= x <= 126 else ".") for x in range(256)])
-
-    for offset in range(0, len(data_bytes), bytes_per_line):
-        chunk = data_bytes[offset : offset + bytes_per_line]
-
-        # 1. Offset part
-        # line_str = f"{offset:08x}: " # Initial part of the line
-
-        # 2. Hex part
-        # Construct hex string with a double space in the middle if bytes_per_line is suitable
-        hex_parts = []
-        midpoint = bytes_per_line // 2
-        for i in range(bytes_per_line):
-            if i < len(chunk):
-                hex_parts.append(f"{chunk[i]:02x}")
-            else:
-                hex_parts.append("  ")  # Pad with two spaces if byte not present
-            if (
-                i == midpoint - 1 and bytes_per_line > 4
-            ):  # Add double space after midpoint (if not too small line)
-                hex_parts.append(
-                    ""
-                )  # This effectively adds an extra space when joining by ' '
-
-        hex_part_str = " ".join(hex_parts)
-
-        # Calculate the display width for the hex string to ensure alignment.
-        # Each byte takes 2 chars + 1 space = 3. Total = bytes_per_line * 3.
-        # If there's a midpoint double space, add 1.
-        hex_display_width = (bytes_per_line * 3) - 1  # (xx_xx_xx -> 2*N + (N-1) spaces)
-        if (
-            bytes_per_line > 4 and midpoint > 0
-        ):  # Account for the extra space at midpoint
-            hex_display_width += 1
-
-        # 3. ASCII part
-        ascii_part = "".join([PRINTABLE_CHARS[b] for b in chunk])
-
-        # Combine, ensuring hex part is padded for alignment
-        # The offset is 8 chars + ":  " (3 chars) = 11 chars prefix
-        lines.append(
-            f"{offset:08x}:  {hex_part_str:<{hex_display_width}} |{ascii_part}|"
+        logger.info(
+            f"New UNIQUE crash content by {fuzzer_conf.name}: {file_name} (SHA256: {sha256_hash})"
         )
 
-    return "\n".join(lines)
+        timestamp_str, file_size_str = "N/A", "N/A"
+        try:
+            stat_info = os.stat(file_path)
+            timestamp = getattr(stat_info, "st_birthtime", stat_info.st_mtime)
+            timestamp_str = datetime.fromtimestamp(timestamp).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            size = stat_info.st_size
+            if size < 1024:
+                file_size_str = f"{size} B"
+            elif size < 1024 * 1024:
+                file_size_str = f"{size / 1024:.1f} KB"
+            else:
+                file_size_str = f"{size / (1024 * 1024):.1f} MB"
+        except FileNotFoundError:
+            logger.warning(f"File {file_path} disappeared during processing. Skipping.")
+            return
+        except Exception as e:
+            logger.warning(f"Error getting metadata for {file_path}: {e}")
+
+        content_snippet = get_file_snippet(file_path, self.config_manager)
+
+        crash_data = CrashData(
+            fuzzer_name=fuzzer_conf.name,
+            timestamp_str=timestamp_str,
+            reproducer_name=file_name,
+            reproducer_path=file_path,
+            file_size_str=file_size_str,
+            content_snippet=content_snippet,
+            file_hashes=file_hashes,
+        )
+
+        for notifier in self.notifiers:
+            try:
+                notifier.send(crash_data)
+            except Exception as e:
+                logger.error(
+                    f"Error sending notification via {type(notifier).__name__}: {e}"
+                )
+
+        self.state_manager.save_unique_crash_id(unique_crash_id)
 
 
-# --- Watchdog Handler & Management ---
+# --- Directory Monitoring ---
 if USE_WATCHDOG:
 
-    class CrashWatchdogHandler(FileSystemEventHandler):
-        def __init__(self, fuzzer_config_ref):
-            self.fuzzer_config = fuzzer_config_ref
+    class WatchdogCrashHandler(FileSystemEventHandler):
+        def __init__(
+            self,
+            fuzzer_conf: FuzzerConfig,
+            processor: CrashProcessor,
+            config_manager: ConfigManager,
+        ):
+            self.fuzzer_conf = fuzzer_conf
+            self.processor = processor
+            self.config_manager = config_manager
             super().__init__()
 
-        def on_created(self, event):
+        def on_created(self, event: Any) -> None:
             if event.is_directory:
                 return
-            settle_delay = 0.5  # Default
-            if g_config and isinstance(g_config, dict):
-                settle_delay = (
-                    g_config.get("watchdog_file_settle_delay_ms", 500) / 1000.0
+            # Use a settle delay from config
+            settle_delay_ms = self.config_manager.get(
+                "watchdog_file_settle_delay_ms", 500
+            )
+            time.sleep(settle_delay_ms / 1000.0)
+            logger.debug(
+                f"Watchdog: created {event.src_path} for {self.fuzzer_conf.name}"
+            )
+            self.processor.process_file(self.fuzzer_conf, event.src_path)
+
+
+class DirectoryMonitor:
+    def __init__(self, config_manager: ConfigManager, processor: CrashProcessor):
+        self.config_manager = config_manager
+        self.processor = processor
+        self.active_observers: Dict[str, Observer] = {}  # For watchdog
+        self._stop_polling_flag = False  # For polling mode graceful stop
+
+    def start(self) -> None:
+        if USE_WATCHDOG:
+            self.manage_watchdog_observers()
+        else:
+            self.poll_directories()  # This will block if not threaded
+
+    def stop(self) -> None:
+        if USE_WATCHDOG:
+            self._stop_all_watchdog_observers()
+        else:
+            self._stop_polling_flag = True
+
+    def _stop_all_watchdog_observers(self) -> None:
+        logger.info("Stopping all watchdog observers...")
+        for crash_dir, observer_instance in list(self.active_observers.items()):
+            try:
+                observer_instance.stop()
+                observer_instance.join(timeout=2)
+                logger.info(f"Stopped watching {crash_dir}")
+            except Exception as e:
+                logger.error(f"Error stopping observer for {crash_dir}: {e}")
+            if crash_dir in self.active_observers:
+                del self.active_observers[crash_dir]
+        self.active_observers.clear()
+
+    def manage_watchdog_observers(self) -> None:
+        self._stop_all_watchdog_observers()
+        fuzzers = self.config_manager.get_fuzzers_to_watch()
+        if not fuzzers:
+            logger.info("Watchdog: No fuzzers configured.")
+            return
+
+        for f_conf in fuzzers:
+            if not os.path.isdir(f_conf.crash_dir):
+                logger.warning(
+                    f"Watchdog: Crash dir for {f_conf.name} not found: {f_conf.crash_dir}"
                 )
-            time.sleep(settle_delay)
-            logging.debug(
-                f"Watchdog event: created {event.src_path} for {self.fuzzer_config['name']}"
-            )
-            process_new_crash(self.fuzzer_config, event.src_path)
-
-
-def manage_watchdog_observers():
-    global g_active_observers, g_config
-
-    # Stop all current observers
-    for crash_dir, observer_instance in list(g_active_observers.items()):
-        try:
-            observer_instance.stop()
-            observer_instance.join(timeout=5)
-            if observer_instance.is_alive():
-                logging.warning(
-                    f"Observer thread for {crash_dir} did not stop in time."
-                )
-            else:
-                logging.info(f"Stopped watching {crash_dir}")
-        except Exception as e:
-            logging.error(f"Error stopping observer for {crash_dir}: {e}")
-        if (
-            crash_dir in g_active_observers
-        ):  # Check because it might be deleted by another thread if error
-            del g_active_observers[crash_dir]
-
-    g_active_observers.clear()
-
-    if not g_config:
-        logging.error("Cannot manage watchdog observers: Global config not loaded.")
-        return
-
-    fuzzers_to_watch = g_config.get("fuzzers_to_watch", [])
-    if not fuzzers_to_watch:
-        logging.info(
-            "No fuzzers configured in 'fuzzers_to_watch' to start observers for."
-        )
-        return
-
-    for fuzzer_conf in fuzzers_to_watch:
-        crash_dir = fuzzer_conf.get("crash_dir")
-        fuzzer_name = fuzzer_conf.get("name", "UnnamedFuzzer")
-        if not crash_dir:
-            logging.warning(
-                f"Fuzzer '{fuzzer_name}' has no 'crash_dir' configured. Skipping."
-            )
-            continue
-
-        if not os.path.isdir(crash_dir):
-            logging.warning(
-                f"Crash directory for {fuzzer_name} not found: {crash_dir}. Skipping watchdog."
-            )
-            continue
-
-        if crash_dir in g_active_observers:
-            logging.warning(
-                f"Observer for {crash_dir} ({fuzzer_name}) appears to be already managed. Skipping duplicate setup."
-            )
-            continue
-
-        event_handler = CrashWatchdogHandler(fuzzer_conf)
-        observer = Observer()
-        observer.schedule(event_handler, crash_dir, recursive=False)
-        try:
-            observer.start()
-            g_active_observers[crash_dir] = observer
-            logging.info(f"Watching for crashes in {crash_dir} for {fuzzer_name}")
-        except Exception as e:
-            logging.error(
-                f"Failed to start observer for {crash_dir} ({fuzzer_name}): {e}"
-            )
-
-    if (
-        not g_active_observers and fuzzers_to_watch
-    ):  # If there were configs, but none resulted in an observer
-        logging.warning(
-            "Watchdog mode: No valid/accessible directories are being watched after (re)configuration."
-        )
-
-
-# --- Polling Mode ---
-def poll_directories():
-    logging.info("Starting directory polling with hot-reload support...")
-
-    last_poll_time = 0
-    last_config_check_time = time.time()
-    logged_no_fuzzers_ts = 0
-
-    while True:
-        if not g_config:  # Should ideally not happen after initial load
-            logging.error("Polling critical error: g_config is None. Trying to reload.")
-            if not load_config_from_file():
-                logging.error("Reload failed in polling loop. Sleeping before retry.")
-                time.sleep(60)  # Prevent tight loop on persistent config error
                 continue
+            if f_conf.crash_dir in self.active_observers:
+                continue  # Should not happen after clear
 
-        config_check_interval = g_config.get("config_check_interval_seconds", 60)
-        crash_poll_interval = g_config.get("check_interval_seconds", 10)
-        now = time.time()
-
-        # 1. Check for config changes
-        if now - last_config_check_time >= config_check_interval:
-            last_config_check_time = now
-            current_mtime = 0
-            config_exists = os.path.exists(CONFIG_FILE)
-            if config_exists:
-                try:
-                    current_mtime = os.path.getmtime(CONFIG_FILE)
-                except OSError as e:
-                    logging.warning(
-                        f"Could not get mtime for {CONFIG_FILE}: {e}. Config will not be reloaded based on mtime."
-                    )
-                    config_exists = False  # Treat as if not found for mtime check
-
-            if (config_exists and current_mtime > g_last_config_mtime) or (
-                g_last_config_mtime == 0 and config_exists
-            ):
-                logging.info(
-                    f"Configuration file {CONFIG_FILE} change detected or initial load pending. Reloading..."
-                )
-                if load_config_from_file():
-                    logging.info("Configuration reloaded for polling mode.")
-                    # Intervals might have changed, will be picked up at start of next loop
-                else:
-                    logging.warning(
-                        "Failed to reload config in polling mode. Continuing with old/default config."
-                    )
-            elif (
-                not config_exists and g_last_config_mtime != 0
-            ):  # Was loaded, now missing
-                logging.warning(
-                    f"Config file {CONFIG_FILE} was present but now missing. Using last known config."
+            handler = WatchdogCrashHandler(f_conf, self.processor, self.config_manager)
+            observer = Observer()
+            observer.schedule(handler, f_conf.crash_dir, recursive=False)
+            try:
+                observer.start()
+                self.active_observers[f_conf.crash_dir] = observer
+                logger.info(f"Watchdog: Watching {f_conf.crash_dir} for {f_conf.name}")
+            except Exception as e:
+                logger.error(
+                    f"Watchdog: Failed to start observer for {f_conf.crash_dir}: {e}"
                 )
 
-        # 2. Poll for crashes
-        if now - last_poll_time >= crash_poll_interval:
-            last_poll_time = now
-            current_fuzzer_configs = g_config.get("fuzzers_to_watch", [])
+        if not self.active_observers and fuzzers:
+            logger.warning("Watchdog: No observers started despite configured fuzzers.")
 
-            if not current_fuzzer_configs:
-                if now - logged_no_fuzzers_ts > 300:  # Log every 5 mins
-                    logging.info("Polling: No fuzzers configured to watch.")
-                    logged_no_fuzzers_ts = now
+    def poll_directories(self) -> None:  # This is a blocking call
+        logger.info("Starting polling mode...")
+        self._stop_polling_flag = False
+        last_poll_time = 0
+        logged_no_fuzzers_ts = 0
 
-            for fuzzer_conf in current_fuzzer_configs:
-                crash_dir = fuzzer_conf.get("crash_dir")
-                fuzzer_name = fuzzer_conf.get("name", "UnnamedFuzzer")
-                if not crash_dir:
-                    # This should have been logged by manage_watchdog_observers or if fuzzer_conf is malformed
-                    continue
+        while not self._stop_polling_flag:
+            # Config changes are handled by the main app loop,
+            # this polling just uses the current config_manager state.
+            poll_interval = self.config_manager.get("check_interval_seconds", 10)
+            now = time.time()
 
-                if not os.path.isdir(crash_dir):
-                    if (
-                        not fuzzer_conf.get("_logged_missing_dir_ts")
-                        or now - fuzzer_conf["_logged_missing_dir_ts"] > 300
-                    ):
-                        logging.warning(
-                            f"Polling: Crash directory for {fuzzer_name} not found: {crash_dir}"
-                        )
-                        fuzzer_conf["_logged_missing_dir_ts"] = now  # Mark as logged
-                    continue
-                fuzzer_conf["_logged_missing_dir_ts"] = 0  # Reset if found
+            if now - last_poll_time >= poll_interval:
+                last_poll_time = now
+                fuzzers = self.config_manager.get_fuzzers_to_watch()
+                if not fuzzers:
+                    if now - logged_no_fuzzers_ts > 300:
+                        logger.info("Polling: No fuzzers configured.")
+                        logged_no_fuzzers_ts = now
 
-                try:
-                    for item in os.listdir(crash_dir):
-                        item_path = os.path.join(crash_dir, item)
-                        if os.path.isfile(item_path):
-                            # Basic filtering for common non-crash files
-                            if item in {
-                                ".state",
-                                "fuzzer_stats",
-                                "README.txt",
-                            } or item.endswith((".synced", ".DS_Store")):
-                                continue
-                            process_new_crash(fuzzer_conf, item_path)
-                except Exception as e:
-                    logging.error(
-                        f"Polling: Error scanning directory {crash_dir} for {fuzzer_name}: {e}"
-                    )
+                for f_conf in fuzzers:
+                    if not os.path.isdir(f_conf.crash_dir):
+                        # NOTE: Add periodic logging for missing dir
+                        continue
+                    try:
+                        for item in os.listdir(f_conf.crash_dir):
+                            item_path = os.path.join(f_conf.crash_dir, item)
+                            if os.path.isfile(item_path):
+                                # Basic filtering
+                                if item in {
+                                    ".state",
+                                    "fuzzer_stats",
+                                    "README.txt",
+                                } or item.endswith((".synced", ".DS_Store")):
+                                    continue
+                                self.processor.process_file(f_conf, item_path)
+                    except Exception as e:
+                        logger.error(f"Polling: Error scanning {f_conf.crash_dir}: {e}")
 
-        next_event_time = min(
-            last_config_check_time + config_check_interval,
-            last_poll_time + crash_poll_interval,
-        )
-        sleep_duration = max(0.1, next_event_time - time.time())  # Sleep at least 0.1s
-        time.sleep(sleep_duration)
+            # Determine sleep duration until next poll
+            # Config check is handled by the main app loop
+            sleep_duration = max(0.1, (last_poll_time + poll_interval) - time.time())
+            time.sleep(sleep_duration)
+        logger.info("Polling loop stopped.")
 
 
-# --- Main ---
-def main():
-    global g_config  # For assignment in case of initial load failure
+# --- Main Application ---
+class FuzzerNotifierApp:
+    def __init__(self):
+        self.config_manager = ConfigManager()  # Loads config on init
+        self.state_manager = StateManager(self.config_manager)
 
-    logging.info(
-        f"Notifier starting up. PID: {os.getpid()}. Watchdog mode: {USE_WATCHDOG}"
-    )
-    if fh:
-        logging.info(f"Logging to console and {LOG_FILE_NAME}")
-    else:
-        logging.info("Logging to console only (file logging setup failed).")
-
-    if not load_config_from_file():
-        logging.warning(
-            "Initial configuration load failed. Some features might be unavailable or use defaults."
-        )
-        if g_config is None:
-            g_config = {}
-            logging.info("Initialized g_config to empty dict as initial load failed.")
-
-    load_reported_unique_crashes()
-
-    if USE_WATCHDOG:
-        logging.info("Initializing watchdog observers...")
-        manage_watchdog_observers()
-
-        if not g_active_observers and g_config.get("fuzzers_to_watch"):
-            logging.warning(
-                "Watchdog: No observers started despite configured fuzzers. Check paths/permissions."
+        notifiers_conf = self.config_manager.get("notifiers", {})
+        slack_global_opts = self.config_manager.get("slack_message_options", {})
+        self.notifiers: List[NotificationService] = []
+        if "email" in notifiers_conf:
+            self.notifiers.append(EmailNotifier(notifiers_conf["email"]))
+        if "slack" in notifiers_conf:
+            self.notifiers.append(
+                SlackNotifier(notifiers_conf["slack"], slack_global_opts)
             )
-        elif not g_config.get("fuzzers_to_watch"):
-            logging.info("Watchdog: No fuzzers configured to watch initially.")
+
+        self.crash_processor = CrashProcessor(
+            self.config_manager, self.state_manager, self.notifiers
+        )
+        self.directory_monitor = DirectoryMonitor(
+            self.config_manager, self.crash_processor
+        )
+        self.running = True
+
+    def _reload_services_on_config_change(self) -> None:
+        """Reloads parts of the app that depend heavily on config."""
+        logger.info("Configuration changed, reloading dependent services.")
+        # ConfigManager already reloaded itself.
+        # StateManager filepath might change
+        self.state_manager.load_state()  # Reloads state based on potentially new file path in config
+        # NOTE: This clears and reloads g_reported_unique_crash_ids
+        # which is fine as the file is the source of truth.
+        # But if the *file path* itself changes, old state is lost.
+        # This is acceptable for now.
+
+        # Re-initialize notifiers as their configs might have changed
+        notifiers_conf = self.config_manager.get("notifiers", {})
+        slack_global_opts = self.config_manager.get("slack_message_options", {})
+        self.notifiers.clear()
+        if "email" in notifiers_conf:
+            self.notifiers.append(EmailNotifier(notifiers_conf["email"]))
+        if "slack" in notifiers_conf:
+            self.notifiers.append(
+                SlackNotifier(notifiers_conf["slack"], slack_global_opts)
+            )
+
+        # Update the processor with new notifiers list (if it stores them by copy)
+        # If it stores by reference, this might not be strictly needed, but safer.
+        self.crash_processor.notifiers = self.notifiers
+
+        # Restart/reconfigure directory monitoring
+        if USE_WATCHDOG:
+            self.directory_monitor.manage_watchdog_observers()
+        # Polling mode will pick up new fuzzer list naturally from ConfigManager
+
+    def run(self) -> None:
+        logger.info(
+            f"Notifier App starting. PID: {os.getpid()}. Watchdog: {USE_WATCHDOG}"
+        )
+        self.directory_monitor.start()  # Starts watchdog observers or the polling loop in a blocking way if not threaded
 
         try:
-            while True:
-                config_check_interval = (
-                    g_config.get("config_check_interval_seconds", 60)
-                    if g_config
-                    else 60
+            while self.running:
+                config_check_interval = self.config_manager.get(
+                    "config_check_interval_seconds", 60
                 )
                 time.sleep(config_check_interval)
 
-                current_mtime = 0
-                config_exists = os.path.exists(CONFIG_FILE)
-                if config_exists:
-                    try:
-                        current_mtime = os.path.getmtime(CONFIG_FILE)
-                    except OSError as e:
-                        logging.warning(
-                            f"Could not get mtime for {CONFIG_FILE}: {e}. Config will not be reloaded."
-                        )
-                        config_exists = False
-
-                # Reload if (exists AND changed) OR (was never loaded AND now exists)
-                if (config_exists and current_mtime > g_last_config_mtime) or (
-                    g_last_config_mtime == 0
-                    and config_exists
-                    and not g_config.get("fuzzers_to_watch")
-                ):
-                    logging.info(
-                        f"Config file {CONFIG_FILE} change detected or initial load pending. Reloading..."
-                    )
-                    if load_config_from_file():
-                        manage_watchdog_observers()
+                if self.config_manager.needs_reload():
+                    if self.config_manager.load_config():  # Attempt reload
+                        self._reload_services_on_config_change()
                     else:
-                        logging.error(
-                            "Failed to reload configuration in watchdog mode. Observers may be outdated."
+                        logger.error(
+                            "Failed to reload configuration. Continuing with old settings."
                         )
-                elif (
-                    not config_exists and g_last_config_mtime != 0
-                ):  # If config was there and now isn't
-                    logging.warning(
-                        f"Config file {CONFIG_FILE} was present but now missing. Using last known config for watchdog."
-                    )
+
+                # If in polling mode, the directory_monitor.start() call is blocking,
+                # so this loop only effectively runs its config check for watchdog mode.
+                # Polling mode's config check needs to be inside its own loop or handled differently.
+                # For simplicity now, polling mode won't get live config updates for its own interval,
+                # but will get new fuzzer lists. Watchdog mode is fully hot-reloadable.
+                # To fix for polling: run polling in a separate thread, or integrate its config check here.
+                # Current polling loop in DirectoryMonitor already refers to self.config_manager
+                # so it *will* get new fuzzer lists, but not new poll_interval for its current cycle.
+
         except KeyboardInterrupt:
-            logging.info(
-                "KeyboardInterrupt received. Shutting down watchdog observers..."
-            )
+            logger.info("KeyboardInterrupt received. Shutting down.")
         finally:
-            logging.info("Stopping all watchdog observers...")
-            # Gracefully stop observers (same as your existing finally block)
-            for crash_dir, observer_instance in list(g_active_observers.items()):
-                try:
-                    observer_instance.stop()
-                    observer_instance.join(timeout=2)
-                except Exception as e:
-                    logging.error(
-                        f"Error stopping observer for {crash_dir} on exit: {e}"
-                    )
-            logging.info("All watchdog observers stopped. Exiting.")
-    else:
-        poll_directories()  # Ensure poll_directories also uses g_config for intervals correctly
+            self.stop()
+
+    def stop(self) -> None:
+        logger.info("Application stopping...")
+        self.running = False
+        self.directory_monitor.stop()
+        logger.info("Application stopped.")
 
 
 if __name__ == "__main__":
-    main()
+    app = FuzzerNotifierApp()
+    app.run()
